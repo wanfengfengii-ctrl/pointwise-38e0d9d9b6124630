@@ -11,7 +11,7 @@ python3 -B check_project.py
 python3 -B demo.py
 ```
 
-`check_project.py` 是项目物化时提供的完整回归入口，执行 `tests` 下的 `test_*.py` 套件。可直接用 `python3 -B -m unittest discover -s tests -t .` 运行同一套测试。演示使用项目内的 `recordings/handover.json` 和临时工作区，展示 A 实测 17、B 复用槽后实测 23，以及 C 先撤回获得空样本回执。演示核对独立手算、重开后的回执和设备结果后输出一行 `POINTWISE_SCENARIO` JSON。
+`check_project.py` 是项目物化时提供的完整回归入口，执行 `tests` 下的 `test_*.py` 套件。可直接用 `python3 -B -m unittest discover -s tests -t .` 运行同一套测试。演示使用项目内的 `recordings/handover.json` 和临时工作区，展示 A 实测 17、B 复用槽后实测 23，以及 C 先撤回获得空样本回执。演示还另用 `recordings/basic.json` 的根前缀和 `handover_inputs.py` 的样例包展示乱序等待、丢回复、归档失败后重试及重开领取固定出处，分别输出一行 `POINTWISE_SCENARIO` 和 `POINTWISE_HANDOVER` JSON。演示核对独立手算、重开后的回执和设备结果后输出。
 
 ## 从 Python 回放
 
@@ -53,8 +53,18 @@ with TemporaryDirectory() as workspace:
 | `advance_recording(order_id=...)` | 核对一张单的设备事实、提交归档并续接可清理工作。省略单号时按单号顺序处理全部未完采集工作。返回状态元组。 |
 | `read_order(order_id)` | 查询 `pending`、`pending_review`、`measured` 或 `withdrawn`，结案时附固定回执号。未知订单报缺。 |
 | `read_receipt(receipt_id)` | 原样查询已提交快照。未知回执报缺。 |
+| `submit_handover(package)` | 接纳、重投或拒绝一个交班包。返回 `accepted` 或 `replay`；非法输入、同号异内容、已知前序摘要不符以及对已绑定位置的竞争包报 `ValueError`。不推进设备。 |
+| `read_receipt_source(receipt_id)` | 已提交回执的固定包出处 `{'package_id', 'sha256', 'package_position'}`；根录制终态为 `None`，未知回执报缺。只读。 |
 
-模块级接口分别位于 `catalog/revisions.py`、`orders/intake.py`、`orders/withdrawal.py`、`capture/session.py`、`orders/status.py` 和 `archive/receipts.py`。SQLite 错误向调用方报告。查询只读。在一个会话中依序调用；多个会话各自持有连接，录制位置由设备事务核对。
+模块级接口分别位于 `catalog/revisions.py`、`orders/intake.py`、`orders/withdrawal.py`、`capture/session.py`、`orders/status.py` 和 `archive/receipts.py`。交班包的解析、摘要、链接与出处存储在 `recorder/handover.py`。SQLite 错误向调用方报告。查询只读。在一个会话中依序调用；多个会话各自持有连接，录制位置由设备事务核对。
+
+## 交班包
+
+白班可以在设备已触发取样、尚未形成终态时结束。夜班把后续录制作为交班包送入同一工作区，`CaptureSession.submit_handover(package)` 只登记包身份，不推进位置或触发设备。包为恰含 `package_id`、`predecessor_id`、`predecessor_sha256` 和 `events` 的字典；摘要按 `HANDOVER_PACKAGES.md` 的规范 JSON 计算。首次接纳返回 `accepted`，同号同内容重投（含已消费或仍在等待的包）返回 `replay`，同号异内容或非法输入报 `ValueError` 且不留新包身份。前序未知时先持久等待；已知时摘要不符即拒绝；接纳后才发现摘要不符的包在推进时失去资格，重投仍为 `replay`。
+
+`advance_recording(event_id)` 在根录制耗尽后按已选前缀的包链继续。只有已选前序的最后一条提交后，才考虑其唯一合格后继：后继须承诺前序身份与摘要，且事件号不得与已选前缀重复。无后继或有多个合格后继都报 `InvalidRecordingEvent`，位置与设备动作不变，按事件号调用也不能绕过竞争。首事件成功前竞争包仍可接纳；首事件的设备动作、位置和包绑定一同提交，因此首事件失败不绑定，成功后即使回复丢失，对已绑定位置新送的竞争包也被拒绝。重开继续用原根录制，无须重投已接纳包。
+
+归档时，实际消费首终态的事件决定回执与出处。丢回复、继续推进或归档提交失败后重试，仍按原终态结算，并在同一次归档中固定包号、摘要和包内位置。`read_receipt_source` 只读已提交归档；根录制终态返回 `None`，旧回执保持原样，未知号报 `ReceiptNotFound`。处置约定见 `HANDOVER_NOTES.md`。
 
 ## 录制与重开
 

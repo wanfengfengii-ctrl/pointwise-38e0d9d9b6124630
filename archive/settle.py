@@ -39,4 +39,4 @@ def settle_terminal(db: Connection, evidence: TerminalEvidence, *, fail_commit: 
         terminal_event_id=terminal.event_id,
         terminal_event_position=terminal.event_position,
     )
-    return commit_settlement(db, record, fail_commit=fail_commit)
+    return commit_settlement(db, record, fail_commit=fail_commit, source=evidence.source)

@@ -1,6 +1,7 @@
 from sqlite3 import Connection
 
 from archive.ledger import ReceiptRecord, find_receipt_for_order, insert_receipt
+from recorder import handover
 
 
 class SettlementConflict(ValueError):
@@ -19,7 +20,10 @@ def _arm_commit_failure(db: Connection) -> None:
     db.execute('INSERT INTO publication_commit_probe VALUES (1, 2)')
 
 
-def commit_settlement(db: Connection, record: ReceiptRecord, *, fail_commit: bool = False) -> ReceiptRecord:
+def commit_settlement(
+    db: Connection, record: ReceiptRecord, *, fail_commit: bool = False,
+    source: dict | None = None,
+) -> ReceiptRecord:
     with db:
         db.execute('BEGIN IMMEDIATE')
         existing = find_receipt_for_order(db, record.order_id)
@@ -28,6 +32,8 @@ def commit_settlement(db: Connection, record: ReceiptRecord, *, fail_commit: boo
                 raise SettlementConflict(f'conflicting terminal for {record.order_id!r}')
             return existing
         insert_receipt(db, record)
+        if source is not None:
+            handover.insert_receipt_source(db, record.receipt_id, source)
         if fail_commit:
             _arm_commit_failure(db)
     return record

@@ -3,12 +3,16 @@ import sqlite3
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
+from archive.receipts import ReceiptNotFound
 from capture.session import open_recording_session
 from catalog.calibration import Calibration
 from catalog.channels import ChannelKey
 from catalog.limits import QualityLimits
 from catalog.revisions import ChannelRevision
-from recorder.events import load_recording
+from handover_inputs import (
+    EXPECTED_A_SOURCE, ROOT_RECORDING, STALE, U2, U3,
+)
+from recorder.events import InvalidRecordingEvent, load_recording
 
 
 def receipt_for(session, order_id):
@@ -21,6 +25,100 @@ def receipt_for(session, order_id):
 def sample_fields(receipt):
     return [receipt.outcome, receipt.raw_value, receipt.micro_units,
             receipt.quality, receipt.measurement_event_id]
+
+
+def run_package_continuation(workspace):
+    """Out-of-order packages, a lost reply and a reopen that claims the source."""
+    day = ChannelRevision(ChannelKey('north-bank', 'K1'), 'R1', Calibration(2, 1),
+                          QualityLimits(0, 35))
+    observed = {'submissions': [], 'errors': [], 'positions': []}
+    with open_recording_session(workspace, ROOT_RECORDING) as session:
+        fixed = session.add_channel_revision(day)
+        session.submit_order('A', fixed)
+        session.advance_recording('A-start')
+        observed['positions'].append(session.endpoint.position())
+        # U3 arrives before its predecessor; STALE commits a wrong digest.
+        observed['submissions'].append(session.submit_handover(U3))
+        observed['submissions'].append(session.submit_handover(STALE))
+
+    with open_recording_session(workspace, ROOT_RECORDING) as session:
+        try:
+            session.advance_recording('A-confirm')
+        except InvalidRecordingEvent:
+            observed['errors'].append('A-confirm before U2')
+        observed['positions'].append(session.endpoint.position())
+        observed['submissions'].append(session.submit_handover(U2))
+        observed['submissions'].append(session.submit_handover(U2))
+        session.advance_recording('A-read')  # lose_reply on the first U2 event
+        observed['after_lost_reply'] = session.endpoint.read_terminal(
+            session.endpoint.lookup_attempt('A').attempt_id).raw_value
+        try:
+            session.advance_recording('A-confirm')
+        except InvalidRecordingEvent:
+            observed['errors'].append('A-confirm before U2 is exhausted')
+        observed['positions'].append(session.endpoint.position())
+        session.advance_recording('A-repeat')
+        session.advance_recording('A-confirm')
+        observed['positions'].append(session.endpoint.position())
+
+    with open_recording_session(workspace, ROOT_RECORDING) as session:
+        try:
+            session.advance_recording(order_id='A', fail_publish=True)
+        except sqlite3.IntegrityError as error:
+            if error.sqlite_errorname != 'SQLITE_CONSTRAINT_FOREIGNKEY':
+                raise
+        else:
+            raise AssertionError('expected the publication commit to fail')
+        try:
+            session.read_receipt('receipt:A')
+        except ReceiptNotFound:
+            observed['errors'].append('receipt unavailable after failed publish')
+        else:
+            raise AssertionError('expected no committed receipt')
+        try:
+            session.read_receipt_source('receipt:A')
+        except ReceiptNotFound:
+            observed['errors'].append('source unavailable after failed publish')
+        else:
+            raise AssertionError('expected no committed source')
+        attempt = session.endpoint.lookup_attempt('A')
+        terminal = session.endpoint.read_terminal(attempt.attempt_id)
+        observed['held_terminal'] = [terminal.kind, terminal.raw_value, terminal.event_id]
+
+    with open_recording_session(workspace, ROOT_RECORDING) as session:
+        session.advance_recording(order_id='A')
+        claimed = receipt_for(session, 'A')
+        observed['source'] = session.read_receipt_source(claimed.receipt_id)
+        observed['receipt'] = sample_fields(claimed)
+        observed['positions'].append(session.endpoint.position())
+        observed['trigger_count'] = session.endpoint.trigger_count()
+
+    with open_recording_session(workspace, ROOT_RECORDING) as session:
+        # Reopening uses the original root recording and needs no resubmission.
+        observed['reopened_source'] = session.read_receipt_source(claimed.receipt_id)
+        observed['reopened_receipt'] = sample_fields(receipt_for(session, 'A'))
+        observed['submissions'].append(session.submit_handover(U2))
+        observed['receipt_count'] = session.business.execute(
+            'SELECT count(*) FROM receipts').fetchone()[0]
+
+    expected = {
+        'submissions': ['accepted', 'accepted', 'accepted', 'replay', 'replay'],
+        'errors': ['A-confirm before U2', 'A-confirm before U2 is exhausted',
+                   'receipt unavailable after failed publish',
+                   'source unavailable after failed publish'],
+        'positions': [1, 1, 2, 4, 4],
+        'after_lost_reply': 17,
+        'held_terminal': ['measured', 17, 'A-read'],
+        'source': EXPECTED_A_SOURCE,
+        'receipt': ['measured', 17, 35, 'in_range', 'A-read'],
+        'trigger_count': 1,
+        'reopened_source': EXPECTED_A_SOURCE,
+        'reopened_receipt': ['measured', 17, 35, 'in_range', 'A-read'],
+        'receipt_count': 1,
+    }
+    if observed != expected:
+        raise AssertionError(f'HANDOVER_SAMPLE_MISMATCH: {observed!r}')
+    return observed
 
 
 def run_handover(workspace):
@@ -117,3 +215,25 @@ def run_handover(workspace):
 if __name__ == '__main__':
     with TemporaryDirectory(prefix='north-bank-') as workspace:
         run_handover(workspace)
+    with TemporaryDirectory(prefix='north-bank-handover-') as workspace:
+        continuation = run_package_continuation(workspace)
+        print('POINTWISE_HANDOVER ' + json.dumps({
+            'case_id': 'v7.package_continuation',
+            'input': {'root_recording': 'recordings/basic.json[:1]',
+                      'submissions': ['U3 (waiting)', 'STALE (wrong digest)',
+                                      'U2', 'U2 (replay)', 'U2 after reopen (replay)'],
+                      'lose_reply': 'U2 event 1 (A-read)',
+                      'failed_publication': 'receipt:A and its source stay unreadable',
+                      'reopen': 'original root recording, no resubmission'},
+            'expected': {'submissions': ['accepted', 'accepted', 'accepted', 'replay', 'replay'],
+                         'positions': [1, 1, 2, 4, 4],
+                         'source': EXPECTED_A_SOURCE,
+                         'receipt': ['measured', 17, 35, 'in_range', 'A-read']},
+            'actual': continuation,
+            'code_paths': ['capture/session.py', 'recorder/handover.py', 'recorder/endpoint.py',
+                           'capture/reconcile.py', 'archive/settle.py',
+                           'archive/publication.py'],
+            'oracle': 'U3 waits for U2; STALE never links; the first U2 event binds position 2 '
+                      'and its lost reply still leaves the measured 17 terminal; the source is '
+                      'U2 at package position 1, fixed across reopen and cleanup.',
+        }, ensure_ascii=False, sort_keys=True))

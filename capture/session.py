@@ -7,6 +7,7 @@ from archive import ledger, receipts
 from capture import progress, reconcile, release
 from catalog import channels, revisions
 from orders import intake, status, store, withdrawal
+from recorder import handover
 from recorder.endpoint import RecordingEndpoint
 from recorder.events import InvalidRecordingEvent, RecordingEvent
 from recorder.replies import ReplyLost
@@ -44,6 +45,16 @@ class CaptureSession:
     def read_receipt(self, receipt_id: str) -> ledger.ReceiptRecord:
         return receipts.read_receipt(self.business, receipt_id)
 
+    def submit_handover(self, package: dict) -> str:
+        """Accept, replay or reject a handover package without moving the device."""
+        return handover.submit(self.business, self.endpoint.recording,
+                               self.endpoint.position, package)
+
+    def read_receipt_source(self, receipt_id: str) -> dict | None:
+        receipts.read_receipt(self.business, receipt_id)
+        source = handover.read_receipt_source(self.business, receipt_id)
+        return None if source is None else dict(source)
+
     def advance_recording(
         self, event_id: str | None = None, *, order_id: str | None = None,
         fail_publish: bool = False, lose_release_reply: bool = False,
@@ -67,31 +78,65 @@ def open_recording_session(
             store.initialize_order_store(db)
             progress.initialize_capture_store(db)
             ledger.initialize_ledger(db)
+            handover.initialize_handover_store(db)
         endpoint = RecordingEndpoint(root / 'device.sqlite3', recording)
+        with db:
+            db.execute('BEGIN IMMEDIATE')
+            handover.reconcile_device_bindings(db, endpoint.package_bindings())
     except BaseException:
         db.close()
         raise
     return CaptureSession(db, endpoint)
 
 
-def _advance_device(session: CaptureSession, event_id: str) -> status.OrderStatus:
-    event = session.endpoint.check_next_event(event_id)
+def _check_order_can_advance(session: CaptureSession, event: RecordingEvent) -> None:
     db = session.business
     order = store.load_order(db, event.order_id)
     if event.kind == 'trigger':
-        with db:
-            db.execute('BEGIN IMMEDIATE')
-            if ledger.find_receipt_for_order(db, event.order_id) is not None:
-                raise InvalidRecordingEvent(f'order {event.order_id!r} is already settled')
-            progress.record_dispatch(db, event.order_id, order.intent.correlation)
+        if ledger.find_receipt_for_order(db, event.order_id) is not None:
+            raise InvalidRecordingEvent(f'order {event.order_id!r} is already settled')
     elif event.kind == 'withdraw':
         if not order.withdrawal_requested and ledger.find_receipt_for_order(db, event.order_id) is None:
             raise InvalidRecordingEvent(f'order {event.order_id!r} has no withdrawal request')
-    try:
-        reply = session.endpoint.advance(event_id)
-    except ReplyLost:
-        reply = None
-    reconcile.record_device_reply(db, event.order_id, reply)
+
+
+def _heal_mirror_if_behind(session: CaptureSession) -> None:
+    """Mirror device-side bindings when an earlier business commit was lost.
+
+    Callers must hold the business write transaction.  Replaying is
+    idempotent and the device binding is authoritative for a bound position.
+    """
+    handover.reconcile_device_bindings(
+        session.business, session.endpoint.package_bindings())
+
+
+def _advance_device(session: CaptureSession, event_id: str) -> status.OrderStatus:
+    db = session.business
+    with db:
+        # The business write transaction is held across the device commit:
+        # competing submissions and advances therefore arbitrate by the order
+        # in which they actually commit, and a failed device action rolls the
+        # dispatch intent and mirror back with it.  The device writes its own
+        # action, position and package binding in one device transaction.
+        db.execute('BEGIN IMMEDIATE')
+        _heal_mirror_if_behind(session)
+        next_position = session.endpoint.position() + 1
+        resolved = handover.resolve_next_event(
+            db, session.endpoint.recording, next_position, event_id)
+        event = resolved.event
+        # Re-validate the device position and guarded device rules before any
+        # write; an error leaves the device and package binding untouched.
+        session.endpoint.check_resolved(resolved)
+        _check_order_can_advance(session, event)
+        if event.kind == 'trigger':
+            progress.record_dispatch(
+                db, event.order_id, store.load_order(db, event.order_id).intent.correlation)
+        try:
+            reply = session.endpoint.advance_resolved(resolved)
+        except ReplyLost:
+            reply = None
+        reconcile.record_reply_in_transaction(db, event.order_id, reply)
+        handover.record_committed_event(db, resolved)
     return session.read_order(event.order_id)
 
 
@@ -108,6 +153,10 @@ def advance_recording(
     else:
         session.read_order(order_id)
         order_ids = (order_id,)
+    if order_ids:
+        with session.business:
+            session.business.execute('BEGIN IMMEDIATE')
+            _heal_mirror_if_behind(session)
     for pending_id in order_ids:
         reconcile.reconcile_attempt(session.business, session.endpoint, pending_id,
                                     fail_publish=fail_publish)
