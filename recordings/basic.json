@@ -1,0 +1,4 @@
+[
+  {"event_id": "A-start", "kind": "trigger", "order_id": "A", "slot": 3},
+  {"event_id": "A-read", "kind": "measure", "order_id": "A", "raw_value": 17}
+]

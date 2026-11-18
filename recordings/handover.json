@@ -1,0 +1,10 @@
+[
+  {"event_id": "A-start", "kind": "trigger", "order_id": "A", "slot": 3},
+  {"event_id": "A-read", "kind": "measure", "order_id": "A", "raw_value": 17},
+  {"event_id": "A-withdraw", "kind": "withdraw", "order_id": "A", "lose_reply": true},
+  {"event_id": "B-start", "kind": "trigger", "order_id": "B", "slot": 3},
+  {"event_id": "B-read", "kind": "measure", "order_id": "B", "raw_value": 23},
+  {"event_id": "C-start", "kind": "trigger", "order_id": "C", "slot": 3},
+  {"event_id": "C-withdraw", "kind": "withdraw", "order_id": "C"},
+  {"event_id": "C-read", "kind": "measure", "order_id": "C", "raw_value": 11}
+]
